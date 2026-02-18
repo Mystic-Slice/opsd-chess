@@ -17,12 +17,10 @@ import torch
 
 from tinker_cookbook import renderers
 from tinker_cookbook.model_info import get_recommended_renderer_name
-from tinker_cookbook.rl.data_processing import assemble_training_data, compute_advantages
+from tinker_cookbook.rl.data_processing import assemble_training_data
 from tinker_cookbook.rl.train import (
-    compute_full_batch_metrics_and_get_sampling_client,
     do_group_rollout_and_filter_constant_reward,
     save_checkpoint_and_get_sampling_client,
-    train_step,
 )
 from tinker_cookbook.rl.types import TrajectoryGroup
 from tinker_cookbook.utils import ml_log
@@ -142,15 +140,18 @@ async def incorporate_kl_penalty(
         student_lp_sum += (student_logprobs * mask).sum()
 
         kl_advantages = kl_coef * kl_i
-        datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
-            # datum.loss_fn_inputs["advantages"].to_torch() + kl_advantages
-            kl_advantages
-        )
+        # Set weights for cross-entropy loss (SL-style)
+        datum.loss_fn_inputs["weights"] = tinker.TensorData.from_torch(kl_advantages)
+        # Remove RL-specific fields not needed by cross-entropy
+        datum.loss_fn_inputs.pop("advantages", None)
+        datum.loss_fn_inputs.pop("logprobs", None)
+        datum.loss_fn_inputs.pop("mask", None)
 
     metrics = {
         "teacher_kl": float(kl_sum / total_mask),
         "logprobs/teacher_mean": float(teacher_lp_sum / total_mask),
         "logprobs/student_mean": float(student_lp_sum / total_mask),
+        "optim/entropy": float(-student_lp_sum / total_mask),
     }
     return metrics
 
@@ -320,7 +321,7 @@ async def main(cfg: OPSDConfig):
         )
 
         # 3. Compute advantages (all zeros since reward=0)
-        advantages_P = compute_advantages(trajectory_groups_P)
+        advantages_P = [torch.zeros(len(tg.trajectories_G)) for tg in trajectory_groups_P]
 
         # 4. Assemble training data
         data_D, metadata_D = assemble_training_data(trajectory_groups_P, advantages_P)
@@ -336,31 +337,25 @@ async def main(cfg: OPSDConfig):
             )
         metrics.update(kl_metrics)
 
-        # 6. Train step
+        # 6. Train step (SL-style forward_backward + optim_step)
         with timed("train", metrics):
-            training_logprobs_D = await train_step(
-                data_D=data_D,
-                training_client=training_client,
-                learning_rate=cfg.learning_rate,
-                num_substeps=cfg.num_substeps,
-                loss_fn=cfg.loss_fn,
-                loss_fn_config=cfg.loss_fn_config,
-                metrics=metrics,
+            adam_params = tinker.AdamParams(
+                learning_rate=cfg.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
             )
+            fwd_bwd_future = await training_client.forward_backward_async(
+                data_D, loss_fn="cross_entropy"
+            )
+            optim_future = await training_client.optim_step_async(adam_params)
+            await fwd_bwd_future.result_async()
+            optim_result = await optim_future.result_async()
+            if optim_result.metrics:
+                metrics.update(optim_result.metrics)
 
-        # 7. Post-step metrics + new sampling client
-        sampling_client, full_batch_metrics = (
-            await compute_full_batch_metrics_and_get_sampling_client(
-                training_client,
-                i_batch + 1,
-                data_D,
-                training_logprobs_D,
-                cfg.log_path,
-                cfg.save_every,
-                do_compute_post_kl=False,
-            )
+        # 7. Get new sampling client (+ periodic checkpoint)
+        sampling_client, checkpoint_metrics = await save_checkpoint_and_get_sampling_client(
+            training_client, i_batch + 1, cfg.log_path, cfg.save_every, start_batch
         )
-        metrics.update(full_batch_metrics)
+        metrics.update(checkpoint_metrics)
 
         metrics["time/total"] = time.time() - t_start
         ml_logger.log_metrics(metrics, step=i_batch)
