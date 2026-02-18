@@ -18,6 +18,7 @@ class OPSDConfig:
     max_tokens: int = 4096
     temperature: float = 1.0
     kl_coef: float = 1.0
+    use_frozen_teacher: bool = False
     loss_fn: LossFnType = "importance_sampling"
     loss_fn_config: dict[str, Any] | None = None
     num_substeps: int = 1

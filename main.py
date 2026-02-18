@@ -161,11 +161,14 @@ async def main(cfg: OPSDConfig):
     renderer_name = get_recommended_renderer_name(cfg.model_name)
     renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
 
-    # --- Frozen teacher: snapshot initial (base model) weights BEFORE loading any checkpoint ---
-    teacher_sampling_client = (
-        await training_client.save_weights_and_get_sampling_client_async("teacher_init")
-    )
-    logger.info("Created frozen teacher sampling client at initial weights")
+    # --- Frozen teacher (optional): snapshot initial weights BEFORE loading any checkpoint ---
+    if cfg.use_frozen_teacher:
+        teacher_sampling_client = (
+            await training_client.save_weights_and_get_sampling_client_async("teacher_init")
+        )
+        logger.info("Created frozen teacher sampling client at initial weights")
+    else:
+        teacher_sampling_client = None
 
     # Now load checkpoint / resume state on top of the training client
     if resume_info:
@@ -299,7 +302,7 @@ async def main(cfg: OPSDConfig):
                 data_D,
                 metadata_D,
                 env_group_builders_P,
-                teacher_sampling_client,
+                teacher_sampling_client if cfg.use_frozen_teacher else sampling_client,
                 cfg.kl_coef,
             )
         metrics.update(kl_metrics)
