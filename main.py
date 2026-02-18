@@ -1,183 +1,49 @@
 """
-Chess On-Policy Self-Distillation (OPSD) Training Script.
+On-Policy Self-Distillation (OPSD) Training Script.
 
-Trains a chess LLM by self-distilling from a "teacher" variant (same model,
+Trains a LLM by self-distilling from a "teacher" variant (same model,
 prompted with the correct answer) to a "student" variant (no answer in prompt).
-The teacher is frozen at initial weights; only the student updates.
 No explicit rewards — only KL divergence between teacher/student distributions.
 """
 
 import asyncio
 import logging
-import math
 import os
 import time
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, cast
 
 import tinker
 import torch
-from tinker.types import LossFnType
 
 from tinker_cookbook import renderers
-from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.model_info import get_recommended_renderer_name
 from tinker_cookbook.rl.data_processing import assemble_training_data, compute_advantages
-from tinker_cookbook.rl.metrics import compute_kl_sample_train
 from tinker_cookbook.rl.train import (
     compute_full_batch_metrics_and_get_sampling_client,
     do_group_rollout_and_filter_constant_reward,
-    gather_with_progress,
     save_checkpoint_and_get_sampling_client,
     train_step,
 )
-from tinker_cookbook.rl.types import (
-    Action,
-    Env,
-    EnvGroupBuilder,
-    Metrics,
-    Observation,
-    RLDataset,
-    StepResult,
-    Trajectory,
-    TrajectoryGroup,
-)
-from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook.rl.types import TrajectoryGroup
 from tinker_cookbook.utils import ml_log
 from tinker_cookbook.utils.misc_utils import safezip, timed
 from tinker_cookbook import checkpoint_utils
 
-import data as chess_data
-from eval import score_moves
-from utils import extract_moves_strict
+from data import CustomDataset, CustomEnvGroupBuilder, get_data, eval_samples
+from config import OPSDConfig
 
 from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-
 # =============================================================================
-# 1. ChessDistillationEnv
+# incorporate_kl_penalty (core novel function)
 # =============================================================================
-
-
-class ChessDistillationEnv(Env):
-    """Single-turn env: student prompt -> model generates reasoning + move -> reward = 0.0"""
-
-    def __init__(
-        self,
-        student_messages: list[renderers.Message],
-        renderer: renderers.Renderer,
-    ):
-        self.student_messages = student_messages
-        self.renderer = renderer
-
-    async def initial_observation(self) -> tuple[Observation, StopCondition]:
-        return (
-            self.renderer.build_generation_prompt(self.student_messages),
-            self.renderer.get_stop_sequences(),
-        )
-
-    async def step(self, action: Action) -> StepResult:
-        return StepResult(
-            reward=0.0,
-            episode_done=True,
-            next_observation=tinker.ModelInput.empty(),
-            next_stop_condition=self.renderer.get_stop_sequences(),
-        )
-
-
-# =============================================================================
-# 2. ChessGroupBuilder
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class ChessGroupBuilder(EnvGroupBuilder):
-    """Builds a group of identical chess envs for GRPO-style advantage centering."""
-
-    student_messages: list[renderers.Message]
-    teacher_prompt_tokens: list[int]
-    renderer: renderers.Renderer
-    group_size: int
-    fen: str
-    best_move_uci: str
-
-    async def make_envs(self) -> Sequence[Env]:
-        return [
-            ChessDistillationEnv(self.student_messages, self.renderer)
-            for _ in range(self.group_size)
-        ]
-
-    async def compute_group_rewards(
-        self, trajectory_group: list[Trajectory], env_group: Sequence[Env]
-    ) -> list[tuple[float, Metrics]]:
-        return [(0.0, {}) for _ in trajectory_group]
-
-    def logging_tags(self) -> list[str]:
-        return ["chess"]
-
-
-# =============================================================================
-# 3. ChessDataset
-# =============================================================================
-
-
-class ChessDataset(RLDataset):
-    """Wraps the HuggingFace chess puzzle dataset for OPSD training."""
-
-    def __init__(
-        self,
-        hf_dataset,
-        batch_size: int,
-        group_size: int,
-        renderer: renderers.Renderer,
-    ):
-        self.hf_dataset = hf_dataset
-        self.batch_size = batch_size
-        self.group_size = group_size
-        self.renderer = renderer
-
-    def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
-        start = index * self.batch_size
-        end = min(start + self.batch_size, len(self.hf_dataset))
-        builders = []
-        for i in range(start, end):
-            row = self.hf_dataset[i]
-            student_messages = row["prompt_student"]
-            teacher_messages = row["prompt_teacher"]
-
-            # Pre-tokenize the teacher prompt for KL computation
-            teacher_prompt_tokens = self.renderer.build_generation_prompt(
-                teacher_messages
-            ).to_ints()
-
-            builders.append(
-                ChessGroupBuilder(
-                    student_messages=student_messages,
-                    teacher_prompt_tokens=teacher_prompt_tokens,
-                    renderer=self.renderer,
-                    group_size=self.group_size,
-                    fen=row["fen"],
-                    best_move_uci=row["best_move_uci"],
-                )
-            )
-        return builders
-
-    def __len__(self) -> int:
-        return math.ceil(len(self.hf_dataset) / self.batch_size)
-
-
-# =============================================================================
-# 4. incorporate_kl_penalty_chess (core novel function)
-# =============================================================================
-
-
-async def incorporate_kl_penalty_chess(
+async def incorporate_kl_penalty(
     data_D: List[tinker.Datum],
     metadata_D: List[dict[str, int]],
-    env_group_builders_P: Sequence[ChessGroupBuilder],
+    env_group_builders_P: Sequence[CustomEnvGroupBuilder],
     teacher_sampling_client: tinker.SamplingClient,
     kl_coef: float,
 ) -> Dict[str, float]:
@@ -260,36 +126,8 @@ async def incorporate_kl_penalty_chess(
     return metrics
 
 # =============================================================================
-# 5. OPSDConfig
+# main() async training loop
 # =============================================================================
-
-
-@dataclass
-class OPSDConfig:
-    model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
-    load_checkpoint_path: str | None = None
-    lora_rank: int = 64
-    learning_rate: float = 2e-5
-    groups_per_batch: int = 32
-    group_size: int = 1
-    max_tokens: int = 4096
-    temperature: float = 1.0
-    kl_coef: float = 1.0
-    loss_fn: LossFnType = "importance_sampling"
-    loss_fn_config: dict[str, Any] | None = None
-    num_substeps: int = 1
-    save_every: int = 20
-    log_path: str = "logs_v3/opsd_chess_recommended"
-    base_url: str | None = None
-    max_step: int | None = 100
-    stockfish_time: float = 0.01
-
-
-# =============================================================================
-# 6. main() async training loop
-# =============================================================================
-
-
 async def main(cfg: OPSDConfig):
     """Main OPSD training loop."""
 
@@ -349,8 +187,8 @@ async def main(cfg: OPSDConfig):
     )
 
     # --- Dataset ---
-    ds = chess_data.get_data()
-    dataset = ChessDataset(
+    ds = get_data()
+    dataset = CustomDataset(
         hf_dataset=ds["train"],
         batch_size=cfg.groups_per_batch,
         group_size=cfg.group_size,
@@ -414,63 +252,28 @@ async def main(cfg: OPSDConfig):
         metrics["batch/num_groups"] = len(trajectory_groups_P)
         metrics["batch/num_trajectories"] = len(all_completion_lengths)
 
-        # --- Score completions with Stockfish ---
-        score_results = []
-        for g_idx, tg in enumerate(trajectory_groups_P):
-            builder = cast(ChessGroupBuilder, env_group_builders_P[g_idx])
-            for traj in tg.trajectories_G:
-                completion_toks = []
-                for t in traj.transitions:
-                    completion_toks.extend(t.ac.tokens)
-                text = tokenizer.decode(completion_toks)
-                model_move = extract_moves_strict(text)
-                score_results.append({
-                    "fen": builder.fen,
-                    "best_move": builder.best_move_uci,
-                    "model_move": model_move,
-                    "parse_success": model_move is not None,
-                    "score": None,
-                })
-
-        num_total = len(score_results)
-        num_parse_ok = sum(1 for r in score_results if r["parse_success"])
-
-        score_results = score_moves(score_results, cfg.stockfish_time)
-
-        valid_scores = [r["score"] for r in score_results if r["parse_success"] and r["score"] != -1000]
-        max_scores = [r["max_score"] for r in score_results]
-        num_illegal = sum(1 for r in score_results if r["parse_success"] and r["score"] == -1000)
-        num_exact_match = sum(1 for r in score_results if r["model_move"] == r["best_move"])
-
-        metrics["eval/num_parse_ok"] = num_parse_ok
-        metrics["eval/num_illegal"] = num_illegal
-        metrics["eval/num_exact_match"] = num_exact_match
-        metrics["eval/num_total"] = num_total
-        metrics["eval/avg_score"] = (
-            sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
-        )
-        metrics["eval/avg_max_score"] = (
-            sum(max_scores) / len(max_scores) if max_scores else 0.0
-        )
-        metrics["eval/score_gap"] = metrics["eval/avg_max_score"] - metrics["eval/avg_score"]
+        # --- Score completions ---
+        sample_metrics = eval_samples(trajectory_groups_P, env_group_builders_P, tokenizer)
+        metrics.update(sample_metrics)
 
         # Log 5 sample completions
         num_samples_to_log = min(5, len(trajectory_groups_P))
         sample_parts = []
         for s_idx in range(num_samples_to_log):
             tg = trajectory_groups_P[s_idx]
-            builder = cast(ChessGroupBuilder, env_group_builders_P[s_idx])
+            builder = cast(CustomEnvGroupBuilder, env_group_builders_P[s_idx])
             question = builder.student_messages[0]["content"]
             traj = tg.trajectories_G[0]
             completion_tokens = []
             for t in traj.transitions:
                 completion_tokens.extend(t.ac.tokens)
             completion_text = tokenizer.decode(completion_tokens)
+            logging_info_env = builder.logging_info()
             sample_parts.append(
                 f"--- Sample {s_idx + 1} ---\n"
-                f"FEN: {builder.fen}\n"
-                f"Best: {builder.best_move_uci}\n"
-                f"A: {completion_text}\n"
+                + "\n".join(f"{field}: {value}" for field, value in logging_info_env.items()) + "\n"
+                + f"Q: {question}\n"
+                + f"A: {completion_text}\n"
                 f"Tokens: {len(completion_tokens)}"
             )
         samples_text = "\n\n".join(sample_parts)
@@ -481,12 +284,7 @@ async def main(cfg: OPSDConfig):
         # Log move score metrics
         logger.info(
             f"Batch {i_batch} metrics: "
-            f"{metrics['eval/avg_score']:.2f} avg_score, "
-            f"{metrics['eval/avg_max_score']:.2f} avg_max_score, "
-            f"{metrics['eval/score_gap']:.2f} score_gap"
-            f" {num_parse_ok} parse_ok,"
-            f" {num_illegal} illegal moves,"
-            f" {num_total} total samples"
+            + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in sample_metrics.items())
         )
 
         # 3. Compute advantages (all zeros since reward=0)
@@ -497,7 +295,7 @@ async def main(cfg: OPSDConfig):
 
         # 5. Incorporate KL penalty (the OPSD signal)
         with timed("kl_penalty", metrics):
-            kl_metrics = await incorporate_kl_penalty_chess(
+            kl_metrics = await incorporate_kl_penalty(
                 data_D,
                 metadata_D,
                 env_group_builders_P,

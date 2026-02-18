@@ -19,15 +19,13 @@ from tinker_cookbook.model_info import get_recommended_renderer_name
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.rl.train import gather_with_progress
 
-import data as chess_data
-from utils import extract_moves_strict, extract_moves
+from data import get_data, score_moves, extract_moves_strict
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class EvalConfig:
@@ -36,45 +34,10 @@ class EvalConfig:
     num_samples: int = 50
     max_tokens: int = 4096
     temperature: float = 0.0
-    output_dir: str = "eval_results_v2"
+    output_dir: str = "eval_results_v3"
     base_url: str | None = None
     stockfish_time: float = 0.01
     use_teacher_prompt: bool = False
-
-
-def score_moves(results: list[dict], stockfish_time: float) -> list[dict]:
-    """Score each model move using Stockfish.
-
-    Takes the list of result dicts (with 'fen', 'model_move', 'expected_move'
-    fields) and fills in 'score' for each one.
-
-    Args:
-        results: List of result dicts from evaluation. Each has:
-            - fen: The board position (FEN string)
-            - model_move: The move the model predicted (str or None)
-            - expected_move: The ground-truth best move (str)
-            - parse_success: Whether a move was extracted from model output
-        stockfish_time: Time limit in seconds for Stockfish analysis per move.
-
-    Returns:
-        The same list with 'score' filled in for each result.
-    """
-    import chess.engine
-    from stockfish import Stockfish
-
-    sf = Stockfish(limit=chess.engine.Limit(time=stockfish_time))
-    try:
-        for result in results:
-            result['max_score'] = sf.get_score(result["fen"], result["best_move"])
-            if not result["parse_success"] or result["model_move"] is None:
-                result["score"] = -1000
-            else:
-                result["score"] = sf.get_score(result["fen"], result["model_move"])
-    finally:
-        del sf
-
-    return results
-
 
 async def evaluate_puzzle(
     idx: int,
@@ -119,7 +82,7 @@ async def main(cfg: EvalConfig):
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     # --- Load test data ---
-    ds = chess_data.get_data()
+    ds = get_data()
     test_ds = ds["test"]
     num_puzzles = min(cfg.num_samples, len(test_ds))
     logger.info(f"Evaluating {num_puzzles} puzzles from test split")
@@ -215,14 +178,14 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="Evaluate chess model")
-    parser.add_argument("--model_name", default="Qwen/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--checkpoint_path", default=None)
-    parser.add_argument("--num_samples", type=int, default=50)
-    parser.add_argument("--max_tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--output_dir", default="eval_results_v2")
-    parser.add_argument("--base_url", default=None)
-    parser.add_argument("--stockfish_time", type=float, default=0.01)
+    parser.add_argument("--model_name", default=EvalConfig.model_name)
+    parser.add_argument("--checkpoint_path", default=EvalConfig.checkpoint_path)
+    parser.add_argument("--num_samples", type=int, default=EvalConfig.num_samples)
+    parser.add_argument("--max_tokens", type=int, default=EvalConfig.max_tokens)
+    parser.add_argument("--temperature", type=float, default=EvalConfig.temperature)
+    parser.add_argument("--output_dir", default=EvalConfig.output_dir)
+    parser.add_argument("--base_url", default=EvalConfig.base_url)
+    parser.add_argument("--stockfish_time", type=float, default=EvalConfig.stockfish_time)
     parser.add_argument("--use_teacher_prompt", action="store_true")
 
     args = parser.parse_args()
