@@ -9,6 +9,7 @@ from typing import Any, Dict, Sequence, cast
 
 import tinker
 
+from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook import renderers
 from tinker_cookbook.completers import StopCondition
 from tinker_cookbook.rl.types import (
@@ -232,7 +233,7 @@ def get_data():
 
     return ds
 
-def eval_samples(trajectory_groups_P: list[TrajectoryGroup], env_group_builders_P: list[CustomEnvGroupBuilder], tokenizer: tinker.Tokenizer) -> Dict[str, Any]:
+def eval_samples(trajectory_groups_P: list[TrajectoryGroup], env_group_builders_P: list[CustomEnvGroupBuilder], tokenizer: Tokenizer) -> Dict[str, Any]:
     score_results = []
     for g_idx, tg in enumerate(trajectory_groups_P):
         builder = cast(CustomEnvGroupBuilder, env_group_builders_P[g_idx])
