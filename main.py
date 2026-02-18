@@ -77,18 +77,55 @@ async def incorporate_kl_penalty(
             tinker.ModelInput.from_ints(teacher_prompt + student_completion)
         )
 
-    teacher_logprobs_D = await asyncio.gather(
+    raw_teacher_logprobs_D = await asyncio.gather(
         *[
             teacher_sampling_client.compute_logprobs_async(sequence_input)
             for sequence_input in teacher_sequences
         ]
     )
 
+    # # Debug: inspect raw teacher logprobs
+    # for d_idx, (raw_lps, teacher_prompt) in enumerate(safezip(raw_teacher_logprobs_D, teacher_prompt_tokens)):
+    #     num_not_none = sum(1 for v in raw_lps if v is not None)
+    #     num_none = sum(1 for v in raw_lps if v is None)
+    #     logger.info(
+    #         f"[DEBUG] datum {d_idx}: raw_teacher_logprobs len={len(raw_lps)}, "
+    #         f"not_none={num_not_none}, none={num_none}, "
+    #         f"teacher_prompt_len={len(teacher_prompt)}, "
+    #         f"teacher_seq_total_len={len(teacher_sequences[d_idx].to_ints())}, "
+    #         f"completion_len={len(raw_lps) - len(teacher_prompt)}"
+    #     )
+    #     # Show first few values around the prompt/completion boundary
+    #     boundary = len(teacher_prompt)
+    #     start = max(0, boundary - 2)
+    #     end = min(len(raw_lps), boundary + 5)
+    #     logger.info(
+    #         f"[DEBUG] datum {d_idx}: logprobs around boundary [{start}:{end}] = {raw_lps[start:end]}"
+    #     )
+
     teacher_logprobs_D = [
         torch.tensor(teacher_logprobs[len(teacher_prompt):])
-        for (teacher_logprobs, teacher_prompt) in safezip(teacher_logprobs_D, teacher_prompt_tokens)
+        for (teacher_logprobs, teacher_prompt) in safezip(raw_teacher_logprobs_D, teacher_prompt_tokens)
     ]
     student_logprobs_D = [datum.loss_fn_inputs["logprobs"].to_torch() for datum in data_D]
+
+    # # Debug: print dimensions of all key tensors
+    # for d_idx in range(min(3, len(data_D))):
+    #     mask = float_masks[d_idx]
+    #     num_completion_tokens = int(mask.sum().item())
+    #     logger.info(
+    #         f"[DEBUG] datum {d_idx}: "
+    #         f"mask shape={mask.shape}, completion_tokens={num_completion_tokens}, "
+    #         f"teacher_logprobs shape={teacher_logprobs_D[d_idx].shape}, "
+    #         f"student_logprobs shape={student_logprobs_D[d_idx].shape}, "
+    #         f"target_tokens len={len(data_D[d_idx].loss_fn_inputs['target_tokens'].tolist())}"
+    #     )
+    #     # Check dimension match
+    #     if teacher_logprobs_D[d_idx].shape[0] != num_completion_tokens:
+    #         logger.warning(
+    #             f"[DEBUG] MISMATCH datum {d_idx}: teacher_logprobs has {teacher_logprobs_D[d_idx].shape[0]} "
+    #             f"elements but mask has {num_completion_tokens} completion tokens!"
+    #         )
 
     kl_sum = torch.tensor(0.0)
     teacher_lp_sum = torch.tensor(0.0)
@@ -104,18 +141,10 @@ async def incorporate_kl_penalty(
         teacher_lp_sum += (full_teacher_lps * mask).sum()
         student_lp_sum += (student_logprobs * mask).sum()
 
-        # Center advantages per-sequence to remove the negative bias.
-        # Without centering, E[A_n] = -KL(p_S||p_T) < 0, which tells the loss
-        # to reduce probability of ALL tokens, causing slow model degradation.
-        num_completion_tokens = mask.sum()
-        if num_completion_tokens > 0:
-            kl_mean = kl_i.sum() / num_completion_tokens
-            centered_kl = kl_i - kl_mean * mask
-        else:
-            centered_kl = kl_i
-        kl_advantages = kl_coef * centered_kl
+        kl_advantages = kl_coef * kl_i
         datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
-            datum.loss_fn_inputs["advantages"].to_torch() + kl_advantages
+            # datum.loss_fn_inputs["advantages"].to_torch() + kl_advantages
+            kl_advantages
         )
 
     metrics = {
