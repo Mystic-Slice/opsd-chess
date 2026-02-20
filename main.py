@@ -35,6 +35,14 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+def context_length_penalty(context_length: int, max_context_length: int) -> float:
+    if context_length <= 0.5 * max_context_length:
+        return 0.0
+    elif context_length <= 0.9 * max_context_length:
+        return (context_length - 0.5 * max_context_length) / ((0.9-0.5) * max_context_length)
+    else:
+        return 1.0
+
 # =============================================================================
 # incorporate_kl_penalty (core novel function)
 # =============================================================================
@@ -44,6 +52,8 @@ async def incorporate_kl_penalty(
     env_group_builders_P: Sequence[CustomEnvGroupBuilder],
     teacher_sampling_client: tinker.SamplingClient,
     kl_coef: float,
+    max_tokens: int,
+    ctx_len_penalty_ratio: float,
 ) -> Dict[str, float]:
     """
     Compute KL divergence between teacher and student with DIFFERENT prompts.
@@ -129,6 +139,7 @@ async def incorporate_kl_penalty(
     teacher_lp_sum = torch.tensor(0.0)
     student_lp_sum = torch.tensor(0.0)
     total_mask = sum(mask.sum() for mask in float_masks)
+    kl_advantages_D = []
 
     for datum, student_logprobs, teacher_logprobs, mask in safezip(data_D, student_logprobs_D, teacher_logprobs_D, float_masks):
         full_teacher_lps = torch.zeros_like(student_logprobs)
@@ -140,15 +151,32 @@ async def incorporate_kl_penalty(
         student_lp_sum += (student_logprobs * mask).sum()
 
         kl_advantages = kl_coef * kl_i
+        kl_advantages_D.append(kl_advantages)
+
+    mean_kl_batch = float(kl_sum / total_mask)
+    max_ctx_len_penalty = ctx_len_penalty_ratio * abs(mean_kl_batch)
+    ctx_len_penalty_D = []
+    loss_total = torch.tensor(0.0)
+    for datum, kl_advantages, mask in safezip(data_D, kl_advantages_D, float_masks):
+        student_completion_length = torch.count_nonzero(mask > 0)
+        # negative because higher ctx lengths need to be discouraged
+        ctx_len_penalty = (-1 * max_ctx_len_penalty * context_length_penalty(student_completion_length, max_tokens))
+        ctx_len_penalty_D.append(ctx_len_penalty)
+
+        # Normalize w.r.t student completion length to prevent length bias
+        loss = ((kl_advantages + ctx_len_penalty) * mask) / student_completion_length
+        loss_total += loss.sum()
         # Set weights for cross-entropy loss (SL-style)
-        datum.loss_fn_inputs["weights"] = tinker.TensorData.from_torch(kl_advantages)
+        datum.loss_fn_inputs["weights"] = tinker.TensorData.from_torch(loss)
         # Remove RL-specific fields not needed by cross-entropy
         datum.loss_fn_inputs.pop("advantages", None)
         datum.loss_fn_inputs.pop("logprobs", None)
         datum.loss_fn_inputs.pop("mask", None)
 
     metrics = {
-        "teacher_kl": float(kl_sum / total_mask),
+        "teacher_kl": mean_kl_batch,
+        "ctx_len_penalty": float(torch.tensor(ctx_len_penalty_D).mean()),
+        "final_loss": float(loss_total / total_mask),
         "logprobs/teacher_mean": float(teacher_lp_sum / total_mask),
         "logprobs/student_mean": float(student_lp_sum / total_mask),
         "optim/entropy": float(-student_lp_sum / total_mask),
@@ -334,6 +362,8 @@ async def main(cfg: OPSDConfig):
                 env_group_builders_P,
                 teacher_sampling_client if cfg.use_frozen_teacher else sampling_client,
                 cfg.kl_coef,
+                cfg.max_tokens,
+                cfg.ctx_len_penalty_ratio,
             )
         metrics.update(kl_metrics)
 
